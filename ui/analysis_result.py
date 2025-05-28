@@ -493,7 +493,12 @@ class AnalysisResult(QMainWindow):
         config_text += f"Avg Power: {power_str}\n"
         config_text += f"Avg Speed: {speed_str}\n"
         config_text += f"System Mass: {self.params.get('system_mass', 90)} kg\n"
-        config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
+        rho_low = self.params.get('rho_low', None)
+        rho_high = self.params.get('rho_high', None)
+        if rho_low and rho_high:
+            config_text += f"Rho (air density): {rho_low} - {rho_high} kg/m³\n"
+        else:
+            config_text += f"Rho (air density): {self.params.get('rho', 1.2)} kg/m³\n"
         config_text += f"Eta (drivetrain eff.): {self.params.get('eta', 0.98)}\n"
         config_text += f"Current CdA: {self.current_cda:.3f}\n"
         config_text += f"Current Crr: {self.current_crr:.4f}\n"
@@ -858,6 +863,8 @@ class AnalysisResult(QMainWindow):
             "crr": self.current_crr,
             "system_mass": self.params.get("system_mass", 90),
             "rho": self.params.get("rho", 1.2),
+            "rho_low": self.params.get("rho_low", None),
+            "rho_high": self.params.get("rho_high", None),
             "eta": self.params.get("eta", 0.98),
             "wind_speed": self.params.get("wind_speed", 0),
             "wind_direction": self.params.get("wind_direction", 0),

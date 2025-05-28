@@ -94,7 +94,27 @@ class AnalysisWindow(QMainWindow):
         # Air density
         self.rho = QLineEdit(str(self.file_settings["rho"]))
         self.rho.setValidator(QDoubleValidator(0, 2, 4))
+        self.rho.textChanged.connect(self.rho_changed)
         param_layout.addRow("Rho (kg/m³):", self.rho)
+
+        # Variable air density
+        var_rho_text = self.rho.text()
+        var_rho_bounds_layout = QHBoxLayout()
+        self.rho_low = QLineEdit()
+        if self.file_settings["rho_low"] is not None:
+            self.rho_low.setText(str(self.file_settings["rho_low"]))
+        self.rho_low.setValidator(QDoubleValidator(0, 2, 4))
+        self.rho_low.setPlaceholderText(var_rho_text)
+
+        self.rho_high = QLineEdit()
+        if self.file_settings["rho_high"] is not None:
+            self.rho_high.setText(str(self.file_settings["rho_high"]))
+        self.rho_high.setValidator(QDoubleValidator(0, 2, 4))
+        var_rho_bounds_layout.addWidget(self.rho_low)
+        var_rho_bounds_layout.addWidget(QLabel("to"))
+        var_rho_bounds_layout.addWidget(self.rho_high)
+        self.rho_high.setPlaceholderText(var_rho_text)
+        param_layout.addRow("Variable Rho (kg/m³):", var_rho_bounds_layout)
 
         # CdA
         self.cda = QLineEdit()
@@ -324,6 +344,8 @@ class AnalysisWindow(QMainWindow):
         new_settings = {
             "system_mass": float(self.system_mass.text()),
             "rho": float(self.rho.text()),
+            "rho_low": float(self.rho_low.text()) if self.rho_low.text() else None,
+            "rho_high": float(self.rho_high.text()) if self.rho_low.text() else None,
             "cda": float(self.cda.text()) if self.cda.text() else None,
             "crr": float(self.crr.text()) if self.crr.text() else None,
             "cda_min": float(self.cda_min.text()),
@@ -353,6 +375,8 @@ class AnalysisWindow(QMainWindow):
         params = {
             "system_mass": float(self.system_mass.text()),
             "rho": float(self.rho.text()),
+            "rho_low": float(self.rho_low.text()) if self.rho_low.text() else None,
+            "rho_high": float(self.rho_high.text()) if self.rho_low.text() else None,
             "cda": float(self.cda.text()) if self.cda.text() else None,
             "crr": float(self.crr.text()) if self.crr.text() else None,
             "cda_min": float(self.cda_min.text()),
@@ -427,6 +451,8 @@ class AnalysisWindow(QMainWindow):
         settings = {
             "system_mass": float(self.system_mass.text()),
             "rho": float(self.rho.text()),
+            "rho_low": float(self.rho_low.text()),
+            "rho_high": float(self.rho_high.text()),
             "cda": float(self.cda.text()) if self.cda.text() else None,
             "crr": float(self.crr.text()) if self.crr.text() else None,
             "cda_min": float(self.cda_min.text()),
@@ -484,3 +510,8 @@ class AnalysisWindow(QMainWindow):
         # Refresh the map if it exists
         if hasattr(self, "map_widget") and self.fit_file.has_gps:
             self.map_widget.create_map()
+
+    def rho_changed(self):
+        var_rho_text = self.rho.text()
+        self.rho_low.setPlaceholderText(var_rho_text)
+        self.rho_high.setPlaceholderText(var_rho_text)

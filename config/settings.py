@@ -83,6 +83,8 @@ class Settings:
         default_settings = {
             "system_mass": 90,
             "rho": 1.2,
+            "rho_high": None,
+            "rho_low": None,
             "cda": None,
             "crr": None,
             "cda_min": 0.150,

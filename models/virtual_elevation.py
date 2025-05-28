@@ -24,7 +24,12 @@ class VirtualElevation:
 
         # Extract parameters
         self.kg = params.get("system_mass", 90)
+
         self.rho = params.get("rho", 1.2)
+        self.rho_high = params.get("rho_high", None)
+        self.rho_low = params.get("rho_low", None)
+        self.use_variable_rho = self.rho_high and self.rho_low
+
         self.eta = params.get("eta", 0.98)
         self.dt = 1.0  # Assume 1 second intervals, can be adjusted
         self.cda = params.get("cda")
@@ -69,6 +74,7 @@ class VirtualElevation:
         # Handle altitude/elevation data
         if "altitude" in self.df.columns:
             self.df["elevation"] = self.df["altitude"]
+        self.calculate_variable_rho()
 
         # Handle zero speed (set to 0.001 as in the R code)
         self.df.loc[self.df["v"] == 0, "v"] = 0.001
@@ -113,6 +119,7 @@ class VirtualElevation:
         w = self.df["watts"].values * self.eta
         vg = self.df["v"].values
         acc = self.df["a"].values
+        rho = self.df["rho"].values
 
         # Calculate effective wind based on direction
         if self.wind_speed != 0 and self.wind_direction is not None:
@@ -134,11 +141,12 @@ class VirtualElevation:
             valid_w = w[valid_idx]
             valid_acc = acc[valid_idx]
             valid_va = va[valid_idx]
+            valid_rho = rho[valid_idx]
 
             # Virtual slope calculation
             valid_slope = (
                 (valid_w / (valid_vg * self.kg * 9.807))
-                - (cda * self.rho * valid_va**2 / (2 * self.kg * 9.807))
+                - (cda * valid_rho * valid_va**2 / (2 * self.kg * 9.807))
                 - crr
                 - valid_acc / 9.807
             )
@@ -521,3 +529,25 @@ class VirtualElevation:
                 effective_wind = np.convolve(effective_wind, kernel, mode="same")
 
         return effective_wind
+
+    def calculate_variable_rho(self):
+        """
+        Interpolate air density (rho) linearly based on elevation.
+        """
+        if not self.use_variable_rho or not "elevation" in self.df.columns:
+            self.df["rho"] = np.full_like(self.df["v"].values, self.rho)
+            return
+
+        elev = self.df["elevation"].values
+
+        elev_min = np.min(elev)
+        elev_max = np.max(elev)
+
+        # Avoid divide by zero if all elevations are the same
+        if elev_max == elev_min:
+            self.df["rho"] = np.full_like(elev, self.rho_high)
+        else:
+            self.df["rho"] = self.rho_low + (self.rho_high - self.rho_low) * (
+                (elev - elev_min) / (elev_max - elev_min)
+            )
+
