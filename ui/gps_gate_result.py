@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import (Qt, QThread)
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -35,7 +35,172 @@ from PySide6.QtWidgets import (
 
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
+from ui.async_worker import AsyncWorker
 
+
+class VEWorker(AsyncWorker):
+    INPUT_KEYS = [
+        "trim_start",
+        "trim_end",
+        "current_cda",
+        "current_crr",
+        "detected_sections",
+    ]
+
+    RESULT_KEYS = [
+        "section_ve_profiles",
+        "section_distances",
+        "all_actual_elevations",
+        "mean_actual_elevations",
+    ]
+
+    def __init__(self, merged_data, params):
+        super(VEWorker, self).__init__()
+        self.merged_data = merged_data
+        self.params = params
+
+    def _process_value(self, values: dict):
+        for key in VEWorker.INPUT_KEYS:
+            if key in values:
+                setattr(self, key, values[key])
+
+        # Recalculate VE metrics and update plots
+        self.calculate_ve()
+
+        out_values = {}
+        for key in VEWorker.RESULT_KEYS:
+            out_values[key] = getattr(self, key)
+
+        return out_values
+
+    def calculate_ve(self):
+        """Calculate virtual elevation for each detected section"""
+        self.section_ve_profiles = []
+        self.section_distances = []
+
+        # Store actual elevation profiles for mean calculation
+        self.all_actual_elevations = (
+            {}
+        )  # Key = gate_set_idx, Value = list of (distances, elevations)
+        self.mean_actual_elevations = (
+            {}
+        )  # Key = gate_set_idx, Value = (distances, mean_elevation)
+
+        if not self.detected_sections:
+            return
+
+        # Check if we have actual elevation data
+        has_elevation = (
+            "altitude" in self.merged_data.columns
+            and not self.merged_data["altitude"].isna().all()
+        )
+
+        # For each detected section, calculate VE
+        for section_idx, section in enumerate(self.detected_sections):
+            gate_set_idx = section["gate_set"]
+            start_idx = section["start_idx"]
+            end_idx = section["end_idx"]
+
+            # Skip invalid indices
+            if (
+                start_idx >= end_idx
+                or start_idx < 0
+                or end_idx >= len(self.merged_data)
+            ):
+                continue
+
+            # Extract section data
+            section_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
+
+            # Create VE calculator for this section
+            ve_calculator = VirtualElevation(section_data, self.params)
+
+            # Calculate VE
+            ve = ve_calculator.calculate_ve(self.current_cda, self.current_crr)
+
+            # Get distance data
+            if "distance" in section_data.columns:
+                # Use distance directly from FIT file (in meters)
+                distances = section_data["distance"].values
+
+                # Make distances relative to start
+                start_distance = distances[0]
+                distances = distances - start_distance
+
+                # Convert to kilometers
+                distances = distances / 1000
+            else:
+                # Fallback if no distance data
+                distances = np.linspace(0, section["distance"], len(ve))
+
+            # Store section data
+            self.section_ve_profiles.append(ve)
+            self.section_distances.append(distances)
+
+            # If we have elevation data, collect it for mean calculation
+            if has_elevation:
+                # Extract actual elevation for this section
+                actual_elevation = section_data["altitude"].values
+
+                # Store by gate set index for mean calculation
+                if gate_set_idx not in self.all_actual_elevations:
+                    self.all_actual_elevations[gate_set_idx] = []
+
+                self.all_actual_elevations[gate_set_idx].append(
+                    (distances, actual_elevation)
+                )
+
+        # Calculate mean actual elevation profile for each gate set
+        if has_elevation:
+            for gate_set_idx, elevations in self.all_actual_elevations.items():
+                if not elevations:
+                    continue
+
+                # Find max distance for this gate set
+                max_dist = 0
+                for distances, _ in elevations:
+                    if len(distances) > 0:
+                        max_dist = max(max_dist, distances[-1])
+
+                # Create reference distance array (1m intervals)
+                ref_distance_m = np.arange(0, int(max_dist * 1000) + 1, 1)
+                ref_distance_km = ref_distance_m / 1000
+
+                # Arrays for accumulating elevation values
+                elevation_sum = np.zeros_like(ref_distance_m, dtype=float)
+                elevation_count = np.zeros_like(ref_distance_m, dtype=int)
+
+                # Interpolate each elevation profile onto reference distance
+                for distances, elevations in elevations:
+                    # Convert distances to meters for indexing
+                    distances_m = distances * 1000
+
+                    # Interpolate onto reference distances
+                    interp_elevation = np.interp(
+                        ref_distance_m,
+                        distances_m,
+                        elevations,
+                        left=np.nan,
+                        right=np.nan,
+                    )
+
+                    # Add to sum and count non-NaN values
+                    valid_mask = ~np.isnan(interp_elevation)
+                    elevation_sum[valid_mask] += interp_elevation[valid_mask]
+                    elevation_count[valid_mask] += 1
+
+                # Calculate mean elevation
+                mean_elevation = np.zeros_like(ref_distance_m, dtype=float)
+                valid_points = elevation_count > 0
+                mean_elevation[valid_points] = (
+                    elevation_sum[valid_points] / elevation_count[valid_points]
+                )
+
+                # Store mean elevation profile
+                self.mean_actual_elevations[gate_set_idx] = (
+                    ref_distance_km,
+                    mean_elevation,
+                )
 
 class MplCanvas(FigureCanvas):
     """Matplotlib canvas for embedding in Qt"""
@@ -75,8 +240,11 @@ class GPSGateResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        # Create VE calculator
-        self.ve_calculator = VirtualElevation(self.merged_data, self.params)
+        self.ve_worker = VEWorker(self.merged_data, self.params)
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_thread.start()
 
         # Get lap combination ID for settings
         self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
@@ -142,9 +310,7 @@ class GPSGateResult(QMainWindow):
         # Detect sections based on gates
         self.detect_sections()
 
-        # Calculate and plot initial VE
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
     def add_gate_set(self):
         """Add a new gate set with default positions"""
@@ -564,8 +730,7 @@ class GPSGateResult(QMainWindow):
 
             # Re-detect sections with the updated gate sets
             self.detect_sections()
-            self.calculate_ve()
-            self.update_plots()
+            self.async_update(True)
 
             self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
             self.map_widget.update()
@@ -599,8 +764,7 @@ class GPSGateResult(QMainWindow):
         if self.add_gate_set():
             self.update_gate_controls()
             self.detect_sections()
-            self.calculate_ve()
-            self.update_plots()
+            self.async_update(True)
             self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
             self.map_widget.update()
 
@@ -983,135 +1147,6 @@ class GPSGateResult(QMainWindow):
 
         return selected_indices
 
-    def calculate_ve(self):
-        """Calculate virtual elevation for each detected section"""
-        self.section_ve_profiles = []
-        self.section_distances = []
-
-        # Store actual elevation profiles for mean calculation
-        self.all_actual_elevations = (
-            {}
-        )  # Key = gate_set_idx, Value = list of (distances, elevations)
-        self.mean_actual_elevations = (
-            {}
-        )  # Key = gate_set_idx, Value = (distances, mean_elevation)
-
-        if not self.detected_sections:
-            return
-
-        # Check if we have actual elevation data
-        has_elevation = (
-            "altitude" in self.merged_data.columns
-            and not self.merged_data["altitude"].isna().all()
-        )
-
-        # For each detected section, calculate VE
-        for section_idx, section in enumerate(self.detected_sections):
-            gate_set_idx = section["gate_set"]
-            start_idx = section["start_idx"]
-            end_idx = section["end_idx"]
-
-            # Skip invalid indices
-            if (
-                start_idx >= end_idx
-                or start_idx < 0
-                or end_idx >= len(self.merged_data)
-            ):
-                continue
-
-            # Extract section data
-            section_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
-
-            # Create VE calculator for this section
-            ve_calculator = VirtualElevation(section_data, self.params)
-
-            # Calculate VE
-            ve = ve_calculator.calculate_ve(self.current_cda, self.current_crr)
-
-            # Get distance data
-            if "distance" in section_data.columns:
-                # Use distance directly from FIT file (in meters)
-                distances = section_data["distance"].values
-
-                # Make distances relative to start
-                start_distance = distances[0]
-                distances = distances - start_distance
-
-                # Convert to kilometers
-                distances = distances / 1000
-            else:
-                # Fallback if no distance data
-                distances = np.linspace(0, section["distance"], len(ve))
-
-            # Store section data
-            self.section_ve_profiles.append(ve)
-            self.section_distances.append(distances)
-
-            # If we have elevation data, collect it for mean calculation
-            if has_elevation:
-                # Extract actual elevation for this section
-                actual_elevation = section_data["altitude"].values
-
-                # Store by gate set index for mean calculation
-                if gate_set_idx not in self.all_actual_elevations:
-                    self.all_actual_elevations[gate_set_idx] = []
-
-                self.all_actual_elevations[gate_set_idx].append(
-                    (distances, actual_elevation)
-                )
-
-        # Calculate mean actual elevation profile for each gate set
-        if has_elevation:
-            for gate_set_idx, elevations in self.all_actual_elevations.items():
-                if not elevations:
-                    continue
-
-                # Find max distance for this gate set
-                max_dist = 0
-                for distances, _ in elevations:
-                    if len(distances) > 0:
-                        max_dist = max(max_dist, distances[-1])
-
-                # Create reference distance array (1m intervals)
-                ref_distance_m = np.arange(0, int(max_dist * 1000) + 1, 1)
-                ref_distance_km = ref_distance_m / 1000
-
-                # Arrays for accumulating elevation values
-                elevation_sum = np.zeros_like(ref_distance_m, dtype=float)
-                elevation_count = np.zeros_like(ref_distance_m, dtype=int)
-
-                # Interpolate each elevation profile onto reference distance
-                for distances, elevations in elevations:
-                    # Convert distances to meters for indexing
-                    distances_m = distances * 1000
-
-                    # Interpolate onto reference distances
-                    interp_elevation = np.interp(
-                        ref_distance_m,
-                        distances_m,
-                        elevations,
-                        left=np.nan,
-                        right=np.nan,
-                    )
-
-                    # Add to sum and count non-NaN values
-                    valid_mask = ~np.isnan(interp_elevation)
-                    elevation_sum[valid_mask] += interp_elevation[valid_mask]
-                    elevation_count[valid_mask] += 1
-
-                # Calculate mean elevation
-                mean_elevation = np.zeros_like(ref_distance_m, dtype=float)
-                valid_points = elevation_count > 0
-                mean_elevation[valid_points] = (
-                    elevation_sum[valid_points] / elevation_count[valid_points]
-                )
-
-                # Store mean elevation profile
-                self.mean_actual_elevations[gate_set_idx] = (
-                    ref_distance_km,
-                    mean_elevation,
-                )
-
     def update_plots(self):
         """Update the virtual elevation plots"""
         # Clear previous plots
@@ -1385,7 +1420,7 @@ class GPSGateResult(QMainWindow):
             )
 
         self.fig_canvas.fig.tight_layout()
-        self.fig_canvas.draw()
+        self.fig_canvas.draw_idle()
 
     def on_gate_a_changed(self, gate_index, value):
         """Handle Gate A slider value change"""
@@ -1423,9 +1458,7 @@ class GPSGateResult(QMainWindow):
         # Detect sections with new gate positions
         self.detect_sections()
 
-        # Calculate VE for new sections
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map
         self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
@@ -1464,9 +1497,7 @@ class GPSGateResult(QMainWindow):
         # Detect sections with new gate positions
         self.detect_sections()
 
-        # Calculate VE for new sections
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map
         self.map_widget.set_gate_sets(self.gate_sets, self.detected_sections)
@@ -1505,9 +1536,7 @@ class GPSGateResult(QMainWindow):
         # Detect sections based on new trim values
         self.detect_sections()
 
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map to show trim points
         self.map_widget.set_trim_start(self.trim_start)
@@ -1548,8 +1577,7 @@ class GPSGateResult(QMainWindow):
         self.detect_sections()
 
         # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map to show trim points
         self.map_widget.set_trim_end(self.trim_end)
@@ -1564,9 +1592,7 @@ class GPSGateResult(QMainWindow):
         self.current_cda = value / 1000.0
         self.cda_label.setText(f"{self.current_cda:.3f}")
 
-        # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(False)
         self.update_config_text()
 
     def on_crr_changed(self, value):
@@ -1575,8 +1601,7 @@ class GPSGateResult(QMainWindow):
         self.crr_label.setText(f"{self.current_crr:.4f}")
 
         # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(False)
         self.update_config_text()
 
     def make_json_serializable(self, obj):
@@ -1775,6 +1800,21 @@ class GPSGateResult(QMainWindow):
         self.parent.show()
         self.close()
 
+    def async_update(self, detect_gate):
+        values = {}
+        for key in VEWorker.INPUT_KEYS:
+            values[key] = getattr(self, key)
+        self.ve_worker.set_values(values)
+
+    def on_ve_result_ready(self, res):
+        for key in VEWorker.RESULT_KEYS:
+            if key in res:
+                setattr(self, key, res[key])
+        self.update_plots()
+
     def closeEvent(self, event):
         self.map_widget.close()
+        self.ve_thread.quit()
+        self.ve_thread.wait()
+
         event.accept()
