@@ -8,7 +8,7 @@ import folium
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import (Qt, QThread)
 from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -32,7 +32,390 @@ from PySide6.QtWidgets import (
 
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
+from ui.async_worker import AsyncWorker
 
+class VEWorker(AsyncWorker):
+    INPUT_KEYS = [
+        "trim_start",
+        "trim_end",
+        "current_cda",
+        "current_crr",
+        "gps_marker_pos"
+    ]
+
+    RESULT_KEYS = [
+        "lap_actual_elevation",
+        "lap_ve_profiles",
+        "lap_distances",
+        "detected_laps",
+        "mean_actual_elevation",
+        "mean_actual_distance_km",
+    ]
+
+    def __init__(self, merged_data, params):
+        super(VEWorker, self).__init__()
+        self.merged_data = merged_data
+        self.params = params
+
+    def _process_value(self, values: dict):
+        for key in VEWorker.INPUT_KEYS:
+            if key in values:
+                setattr(self, key, values[key])
+
+        # Detect laps based on GPS marker
+        if values["detect_laps"]:
+            self.detect_laps()
+
+        # Recalculate VE metrics and update plots
+        self.calculate_ve()
+
+        out_values = {}
+        for key in VEWorker.RESULT_KEYS:
+            out_values[key] = getattr(self, key)
+        out_values["detect_laps"] = values["detect_laps"]
+
+        return out_values
+
+    def detect_laps(self):
+        """Detect laps based on GPS marker with improved directional detection and overlap prevention"""
+        self.detected_laps = []
+
+        # Get valid GPS coordinates
+        valid_coords = self.merged_data.dropna(subset=["position_lat", "position_long"])
+        if valid_coords.empty:
+            return
+
+        # Get the GPS marker position
+        marker_idx = self.gps_marker_pos
+        if marker_idx < 0 or marker_idx >= len(valid_coords):
+            return
+
+        marker_lat = valid_coords.iloc[marker_idx]["position_lat"]
+        marker_lon = valid_coords.iloc[marker_idx]["position_long"]
+
+        # Calculate distance from each point to the marker
+        from math import atan2, cos, degrees, radians, sin, sqrt
+
+        def haversine(lat1, lon1, lat2, lon2):
+            """Calculate the great circle distance between two points in meters"""
+            R = 6371000  # Earth radius in meters
+            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+            c = 2 * atan2(sqrt(a), sqrt(1 - a))
+            return R * c
+
+        # Calculate bearing between two points
+        def calculate_bearing(lat1, lon1, lat2, lon2):
+            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+            y = sin(lon2 - lon1) * cos(lat2)
+            x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lon2 - lon1)
+            bearing = atan2(y, x)
+            return (degrees(bearing) + 360) % 360
+
+        # Define a threshold for being "at" the marker (e.g., 20 meters)
+        threshold = 20  # meters
+
+        # Calculate smoothed bearings for the entire track
+        bearings = []
+        window_size = 5  # Points to use for smoother bearing calculation
+
+        for i in range(len(valid_coords)):
+            if i < window_size:
+                # For the first points, use forward-looking window
+                if i + window_size < len(valid_coords):
+                    start_lat = valid_coords.iloc[i]["position_lat"]
+                    start_lon = valid_coords.iloc[i]["position_long"]
+                    end_lat = valid_coords.iloc[i + window_size]["position_lat"]
+                    end_lon = valid_coords.iloc[i + window_size]["position_long"]
+                    bearings.append(
+                        calculate_bearing(start_lat, start_lon, end_lat, end_lon)
+                    )
+                else:
+                    # Fallback if we don't have enough points ahead
+                    if i + 1 < len(valid_coords):
+                        start_lat = valid_coords.iloc[i]["position_lat"]
+                        start_lon = valid_coords.iloc[i]["position_long"]
+                        end_lat = valid_coords.iloc[i + 1]["position_lat"]
+                        end_lon = valid_coords.iloc[i + 1]["position_long"]
+                        bearings.append(
+                            calculate_bearing(start_lat, start_lon, end_lat, end_lon)
+                        )
+                    else:
+                        # Just copy the previous bearing if we're at the last point
+                        bearings.append(bearings[-1] if bearings else 0)
+            elif i >= len(valid_coords) - window_size:
+                # For the last points, use backward-looking window
+                start_lat = valid_coords.iloc[i - window_size]["position_lat"]
+                start_lon = valid_coords.iloc[i - window_size]["position_long"]
+                end_lat = valid_coords.iloc[i]["position_lat"]
+                end_lon = valid_coords.iloc[i]["position_long"]
+                bearings.append(
+                    calculate_bearing(start_lat, start_lon, end_lat, end_lon)
+                )
+            else:
+                # For middle points, use points before and after
+                start_lat = valid_coords.iloc[i - window_size // 2]["position_lat"]
+                start_lon = valid_coords.iloc[i - window_size // 2]["position_long"]
+                end_lat = valid_coords.iloc[i + window_size // 2]["position_lat"]
+                end_lon = valid_coords.iloc[i + window_size // 2]["position_long"]
+                bearings.append(
+                    calculate_bearing(start_lat, start_lon, end_lat, end_lon)
+                )
+
+        # Find all points where we pass near the marker within the trimmed region
+        passings = []
+        for i in range(self.trim_start, min(self.trim_end + 1, len(valid_coords))):
+            if i >= len(valid_coords):
+                continue
+
+            point_lat = valid_coords.iloc[i]["position_lat"]
+            point_lon = valid_coords.iloc[i]["position_long"]
+
+            distance = haversine(marker_lat, marker_lon, point_lat, point_lon)
+
+            if distance < threshold:
+                direction = bearings[i] if i < len(bearings) else 0
+
+                passings.append(
+                    {
+                        "index": i,
+                        "distance": distance,
+                        "direction": direction,
+                        "timestamp": valid_coords.iloc[i]["timestamp"],
+                    }
+                )
+
+        # Group nearby passings and keep only the closest point for each group
+        grouped_passings = []
+        current_group = []
+
+        for passing in passings:
+            if (
+                not current_group or passing["index"] - current_group[-1]["index"] <= 5
+            ):  # Points within 5 seconds are grouped
+                current_group.append(passing)
+            else:
+                # Find the closest point in the group
+                if current_group:
+                    closest = min(current_group, key=lambda x: x["distance"])
+                    grouped_passings.append(closest)
+                current_group = [passing]
+
+        # Add the last group if it exists
+        if current_group:
+            closest = min(current_group, key=lambda x: x["distance"])
+            grouped_passings.append(closest)
+
+        # Find first reference passing direction
+        reference_direction = None
+        if grouped_passings:
+            reference_direction = grouped_passings[0]["direction"]
+
+        # Use a smaller angle threshold (30 degrees) for more precise direction matching
+        angle_threshold = 30
+
+        # Process consecutive passings in order
+        # This prevents overlapping laps by ensuring a lap must end before a new one can start
+        if len(grouped_passings) >= 2:
+            # Sort passings by index
+            grouped_passings.sort(key=lambda x: x["index"])
+
+            # Start with the first passing
+            lap_start = 0
+
+            # Process all remaining passings as potential lap ends
+            while lap_start < len(grouped_passings) - 1:
+                lap_end = None
+
+                # Find the next passing in the same direction
+                for j in range(lap_start + 1, len(grouped_passings)):
+                    # Calculate directional difference to the current passing
+                    dir_diff = abs(
+                        grouped_passings[lap_start]["direction"]
+                        - grouped_passings[j]["direction"]
+                    )
+                    dir_diff = min(dir_diff, 360 - dir_diff)
+
+                    # Check if it's in the same direction
+                    if dir_diff < angle_threshold:
+                        # Found a valid lap end
+                        lap_end = j
+                        break
+
+                # If we found a valid lap end, create the lap
+                if lap_end is not None:
+                    start_passing = grouped_passings[lap_start]
+                    end_passing = grouped_passings[lap_end]
+
+                    lap = {
+                        "start_idx": start_passing["index"],
+                        "end_idx": end_passing["index"],
+                        "start_time": start_passing["timestamp"],
+                        "end_time": end_passing["timestamp"],
+                        "start_direction": start_passing["direction"],
+                        "end_direction": end_passing["direction"],
+                    }
+
+                    # Calculate duration and distance for this lap
+                    duration = (lap["end_time"] - lap["start_time"]).total_seconds()
+
+                    # Sum distance between all points in the lap
+                    distance = 0
+                    distance = (
+                        self.merged_data.iloc[end_passing["index"]]["distance"]
+                        - self.merged_data.iloc[start_passing["index"]]["distance"]
+                    )
+
+                    lap["duration"] = duration
+                    lap["distance"] = distance / 1000  # Convert to km
+
+                    # Add the compass direction as a human-readable value
+                    direction_names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                    direction_idx = round(lap["start_direction"] / 45) % 8
+                    lap["direction_name"] = direction_names[direction_idx]
+
+                    self.detected_laps.append(lap)
+
+                    # Move to the next lap start
+                    lap_start = lap_end
+                else:
+                    # No more valid laps to be found
+                    break
+
+    def calculate_ve(self):
+        """Calculate virtual elevation for each detected lap"""
+        self.lap_ve_profiles = []
+        self.lap_distances = []
+
+        # New: Store actual elevation profiles for each lap and mean elevation
+        self.lap_actual_elevation = []
+        self.mean_actual_elevation = None
+
+        if not self.detected_laps:
+            return
+
+        # Check if we have actual elevation data
+        has_elevation = (
+            "altitude" in self.merged_data.columns
+            and not self.merged_data["altitude"].isna().all()
+        )
+
+        # Create a common distance array for resampling all laps
+        max_lap_distance = 0
+        count = 0
+        for lap in self.detected_laps:
+            if "distance" in lap:
+                max_lap_distance = max(max_lap_distance, lap["distance"])
+
+        # Create a reference distance array with 1-meter intervals
+        if max_lap_distance > 0:
+            reference_distance = np.linspace(
+                0, max_lap_distance * 1000, int(max_lap_distance * 1000) + 1
+            )
+            reference_distance_km = (
+                reference_distance / 1000
+            )  # Store in km for plotting
+        else:
+            # Fallback if no distance data
+            reference_distance = np.array([0])
+            reference_distance_km = np.array([0])
+
+        # For each detected lap, calculate VE and actual elevation profile
+        for lap in self.detected_laps:
+            start_idx = lap["start_idx"]
+            end_idx = lap["end_idx"]
+
+            # Extract lap data
+            if (
+                start_idx >= end_idx
+                or start_idx < 0
+                or end_idx >= len(self.merged_data)
+            ):
+                continue
+
+            lap_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
+
+            # Create a VE calculator for this lap
+            lap_ve_calculator = VirtualElevation(lap_data, self.params)
+
+            # Calculate VE
+            ve = lap_ve_calculator.calculate_ve(self.current_cda, self.current_crr)
+
+            # Get or calculate distances
+            if "distance" in lap_data.columns:
+                # Use distance directly from the FIT file (in meters)
+                distances = lap_data["distance"].values
+
+                # Make distances cumulative and relative to the start of this lap
+                start_distance = distances[0]
+                distances = distances - start_distance
+
+                # Convert to kilometers
+                distances = distances / 1000
+            else:
+                # Fallback if distance field isn't available
+                distances = [0]  # Start at 0
+
+                # Use speed data if available
+                if "speed" in lap_data.columns:
+                    speeds = lap_data["speed"].values  # m/s
+                    for i in range(1, len(speeds)):
+                        # Calculate distance as speed * time (assuming 1 second intervals)
+                        distance = speeds[i] * 1
+                        distances.append(distances[-1] + distance)
+                else:
+                    # Use lap distance and divide evenly
+                    distances = np.linspace(0, lap["distance"] * 1000, len(ve))
+
+                # Convert to kilometers for plotting
+                distances = np.array(distances) / 1000
+
+            # Store the original VE and distances
+            self.lap_ve_profiles.append(ve)
+            self.lap_distances.append(distances)
+
+            # If we have elevation data, extract the actual elevation profile
+            if has_elevation:
+                # Extract actual elevation profile for this lap
+                actual_elevation = lap_data["altitude"].values
+
+                # Store the actual elevation profile with its distances
+                self.lap_actual_elevation.append((distances, actual_elevation))
+
+        # Calculate mean actual elevation profile if we have elevation data
+        if has_elevation and self.lap_actual_elevation:
+            # Initialize array to accumulate elevation values
+            elevation_sum = np.zeros_like(reference_distance)
+            elevation_count = np.zeros_like(reference_distance)
+
+            # For each lap's actual elevation profile
+            for distances, elevations in self.lap_actual_elevation:
+                # Interpolate this lap's elevation onto the reference distance array
+                interpolated_elevation = np.interp(
+                    reference_distance,
+                    distances * 1000,  # Convert km to m
+                    elevations,
+                    left=np.nan,
+                    right=np.nan,
+                )
+
+                # Add to the sum and count non-NaN values
+                valid_mask = ~np.isnan(interpolated_elevation)
+                elevation_sum[valid_mask] += interpolated_elevation[valid_mask]
+                elevation_count[valid_mask] += 1
+
+            # Calculate mean, avoiding division by zero
+            mean_elevation = np.zeros_like(reference_distance)
+            valid_points = elevation_count > 0
+            mean_elevation[valid_points] = (
+                elevation_sum[valid_points] / elevation_count[valid_points]
+            )
+
+            # Store the mean actual elevation profile
+            self.mean_actual_elevation = mean_elevation
+            self.mean_actual_distance_km = reference_distance_km
 
 class MplCanvas(FigureCanvas):
     """Matplotlib canvas for embedding in Qt"""
@@ -68,8 +451,11 @@ class GPSLapResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        # Create VE calculator
-        self.ve_calculator = VirtualElevation(self.merged_data, self.params)
+        self.ve_worker = VEWorker(self.merged_data, self.params)
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_thread.start()
 
         # Get lap combination ID for settings
         self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
@@ -120,12 +506,7 @@ class GPSLapResult(QMainWindow):
         # Setup UI
         self.initUI()
 
-        # Detect laps based on GPS marker
-        self.detect_laps()
-
-        # Calculate and plot initial VE
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
     def prepare_merged_data(self):
         """Extract and merge data for selected laps"""
@@ -399,220 +780,6 @@ class GPSLapResult(QMainWindow):
 
         self.config_text.setText(config_text)
 
-    def detect_laps(self):
-        """Detect laps based on GPS marker with improved directional detection and overlap prevention"""
-        self.detected_laps = []
-
-        if not self.has_gps:
-            return
-
-        # Get valid GPS coordinates
-        valid_coords = self.merged_data.dropna(subset=["position_lat", "position_long"])
-        if valid_coords.empty:
-            return
-
-        # Get the GPS marker position
-        marker_idx = self.gps_marker_pos
-        if marker_idx < 0 or marker_idx >= len(valid_coords):
-            return
-
-        marker_lat = valid_coords.iloc[marker_idx]["position_lat"]
-        marker_lon = valid_coords.iloc[marker_idx]["position_long"]
-
-        # Calculate distance from each point to the marker
-        from math import atan2, cos, degrees, radians, sin, sqrt
-
-        def haversine(lat1, lon1, lat2, lon2):
-            """Calculate the great circle distance between two points in meters"""
-            R = 6371000  # Earth radius in meters
-            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-            c = 2 * atan2(sqrt(a), sqrt(1 - a))
-            return R * c
-
-        # Calculate bearing between two points
-        def calculate_bearing(lat1, lon1, lat2, lon2):
-            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-            y = sin(lon2 - lon1) * cos(lat2)
-            x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lon2 - lon1)
-            bearing = atan2(y, x)
-            return (degrees(bearing) + 360) % 360
-
-        # Define a threshold for being "at" the marker (e.g., 20 meters)
-        threshold = 20  # meters
-
-        # Calculate smoothed bearings for the entire track
-        bearings = []
-        window_size = 5  # Points to use for smoother bearing calculation
-
-        for i in range(len(valid_coords)):
-            if i < window_size:
-                # For the first points, use forward-looking window
-                if i + window_size < len(valid_coords):
-                    start_lat = valid_coords.iloc[i]["position_lat"]
-                    start_lon = valid_coords.iloc[i]["position_long"]
-                    end_lat = valid_coords.iloc[i + window_size]["position_lat"]
-                    end_lon = valid_coords.iloc[i + window_size]["position_long"]
-                    bearings.append(
-                        calculate_bearing(start_lat, start_lon, end_lat, end_lon)
-                    )
-                else:
-                    # Fallback if we don't have enough points ahead
-                    if i + 1 < len(valid_coords):
-                        start_lat = valid_coords.iloc[i]["position_lat"]
-                        start_lon = valid_coords.iloc[i]["position_long"]
-                        end_lat = valid_coords.iloc[i + 1]["position_lat"]
-                        end_lon = valid_coords.iloc[i + 1]["position_long"]
-                        bearings.append(
-                            calculate_bearing(start_lat, start_lon, end_lat, end_lon)
-                        )
-                    else:
-                        # Just copy the previous bearing if we're at the last point
-                        bearings.append(bearings[-1] if bearings else 0)
-            elif i >= len(valid_coords) - window_size:
-                # For the last points, use backward-looking window
-                start_lat = valid_coords.iloc[i - window_size]["position_lat"]
-                start_lon = valid_coords.iloc[i - window_size]["position_long"]
-                end_lat = valid_coords.iloc[i]["position_lat"]
-                end_lon = valid_coords.iloc[i]["position_long"]
-                bearings.append(
-                    calculate_bearing(start_lat, start_lon, end_lat, end_lon)
-                )
-            else:
-                # For middle points, use points before and after
-                start_lat = valid_coords.iloc[i - window_size // 2]["position_lat"]
-                start_lon = valid_coords.iloc[i - window_size // 2]["position_long"]
-                end_lat = valid_coords.iloc[i + window_size // 2]["position_lat"]
-                end_lon = valid_coords.iloc[i + window_size // 2]["position_long"]
-                bearings.append(
-                    calculate_bearing(start_lat, start_lon, end_lat, end_lon)
-                )
-
-        # Find all points where we pass near the marker within the trimmed region
-        passings = []
-        for i in range(self.trim_start, min(self.trim_end + 1, len(valid_coords))):
-            if i >= len(valid_coords):
-                continue
-
-            point_lat = valid_coords.iloc[i]["position_lat"]
-            point_lon = valid_coords.iloc[i]["position_long"]
-
-            distance = haversine(marker_lat, marker_lon, point_lat, point_lon)
-
-            if distance < threshold:
-                direction = bearings[i] if i < len(bearings) else 0
-
-                passings.append(
-                    {
-                        "index": i,
-                        "distance": distance,
-                        "direction": direction,
-                        "timestamp": valid_coords.iloc[i]["timestamp"],
-                    }
-                )
-
-        # Group nearby passings and keep only the closest point for each group
-        grouped_passings = []
-        current_group = []
-
-        for passing in passings:
-            if (
-                not current_group or passing["index"] - current_group[-1]["index"] <= 5
-            ):  # Points within 5 seconds are grouped
-                current_group.append(passing)
-            else:
-                # Find the closest point in the group
-                if current_group:
-                    closest = min(current_group, key=lambda x: x["distance"])
-                    grouped_passings.append(closest)
-                current_group = [passing]
-
-        # Add the last group if it exists
-        if current_group:
-            closest = min(current_group, key=lambda x: x["distance"])
-            grouped_passings.append(closest)
-
-        # Find first reference passing direction
-        reference_direction = None
-        if grouped_passings:
-            reference_direction = grouped_passings[0]["direction"]
-
-        # Use a smaller angle threshold (30 degrees) for more precise direction matching
-        angle_threshold = 30
-
-        # Process consecutive passings in order
-        # This prevents overlapping laps by ensuring a lap must end before a new one can start
-        if len(grouped_passings) >= 2:
-            # Sort passings by index
-            grouped_passings.sort(key=lambda x: x["index"])
-
-            # Start with the first passing
-            lap_start = 0
-
-            # Process all remaining passings as potential lap ends
-            while lap_start < len(grouped_passings) - 1:
-                lap_end = None
-
-                # Find the next passing in the same direction
-                for j in range(lap_start + 1, len(grouped_passings)):
-                    # Calculate directional difference to the current passing
-                    dir_diff = abs(
-                        grouped_passings[lap_start]["direction"]
-                        - grouped_passings[j]["direction"]
-                    )
-                    dir_diff = min(dir_diff, 360 - dir_diff)
-
-                    # Check if it's in the same direction
-                    if dir_diff < angle_threshold:
-                        # Found a valid lap end
-                        lap_end = j
-                        break
-
-                # If we found a valid lap end, create the lap
-                if lap_end is not None:
-                    start_passing = grouped_passings[lap_start]
-                    end_passing = grouped_passings[lap_end]
-
-                    lap = {
-                        "start_idx": start_passing["index"],
-                        "end_idx": end_passing["index"],
-                        "start_time": start_passing["timestamp"],
-                        "end_time": end_passing["timestamp"],
-                        "start_direction": start_passing["direction"],
-                        "end_direction": end_passing["direction"],
-                    }
-
-                    # Calculate duration and distance for this lap
-                    duration = (lap["end_time"] - lap["start_time"]).total_seconds()
-
-                    # Sum distance between all points in the lap
-                    distance = 0
-                    distance = (
-                        self.merged_data.iloc[end_passing["index"]]["distance"]
-                        - self.merged_data.iloc[start_passing["index"]]["distance"]
-                    )
-
-                    lap["duration"] = duration
-                    lap["distance"] = distance / 1000  # Convert to km
-
-                    # Add the compass direction as a human-readable value
-                    direction_names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-                    direction_idx = round(lap["start_direction"] / 45) % 8
-                    lap["direction_name"] = direction_names[direction_idx]
-
-                    self.detected_laps.append(lap)
-
-                    # Move to the next lap start
-                    lap_start = lap_end
-                else:
-                    # No more valid laps to be found
-                    break
-
-        # Update the lap table
-        self.update_lap_table()
-
     def update_lap_table(self):
         """Update the lap table with detected laps"""
         self.lap_table.setRowCount(len(self.detected_laps))
@@ -661,139 +828,6 @@ class GPSLapResult(QMainWindow):
                 selected_indices.append(row)
 
         return selected_indices
-
-    def calculate_ve(self):
-        """Calculate virtual elevation for each detected lap"""
-        self.lap_ve_profiles = []
-        self.lap_distances = []
-
-        # New: Store actual elevation profiles for each lap and mean elevation
-        self.lap_actual_elevation = []
-        self.mean_actual_elevation = None
-
-        if not self.detected_laps:
-            return
-
-        # Check if we have actual elevation data
-        has_elevation = (
-            "altitude" in self.merged_data.columns
-            and not self.merged_data["altitude"].isna().all()
-        )
-
-        # Create a common distance array for resampling all laps
-        max_lap_distance = 0
-        count = 0
-        for lap in self.detected_laps:
-            if "distance" in lap:
-                max_lap_distance = max(max_lap_distance, lap["distance"])
-
-        # Create a reference distance array with 1-meter intervals
-        if max_lap_distance > 0:
-            reference_distance = np.linspace(
-                0, max_lap_distance * 1000, int(max_lap_distance * 1000) + 1
-            )
-            reference_distance_km = (
-                reference_distance / 1000
-            )  # Store in km for plotting
-        else:
-            # Fallback if no distance data
-            reference_distance = np.array([0])
-            reference_distance_km = np.array([0])
-
-        # For each detected lap, calculate VE and actual elevation profile
-        for lap in self.detected_laps:
-            start_idx = lap["start_idx"]
-            end_idx = lap["end_idx"]
-
-            # Extract lap data
-            if (
-                start_idx >= end_idx
-                or start_idx < 0
-                or end_idx >= len(self.merged_data)
-            ):
-                continue
-
-            lap_data = self.merged_data.iloc[start_idx : end_idx + 1].copy()
-
-            # Create a VE calculator for this lap
-            lap_ve_calculator = VirtualElevation(lap_data, self.params)
-
-            # Calculate VE
-            ve = lap_ve_calculator.calculate_ve(self.current_cda, self.current_crr)
-
-            # Get or calculate distances
-            if "distance" in lap_data.columns:
-                # Use distance directly from the FIT file (in meters)
-                distances = lap_data["distance"].values
-
-                # Make distances cumulative and relative to the start of this lap
-                start_distance = distances[0]
-                distances = distances - start_distance
-
-                # Convert to kilometers
-                distances = distances / 1000
-            else:
-                # Fallback if distance field isn't available
-                distances = [0]  # Start at 0
-
-                # Use speed data if available
-                if "speed" in lap_data.columns:
-                    speeds = lap_data["speed"].values  # m/s
-                    for i in range(1, len(speeds)):
-                        # Calculate distance as speed * time (assuming 1 second intervals)
-                        distance = speeds[i] * 1
-                        distances.append(distances[-1] + distance)
-                else:
-                    # Use lap distance and divide evenly
-                    distances = np.linspace(0, lap["distance"] * 1000, len(ve))
-
-                # Convert to kilometers for plotting
-                distances = np.array(distances) / 1000
-
-            # Store the original VE and distances
-            self.lap_ve_profiles.append(ve)
-            self.lap_distances.append(distances)
-
-            # If we have elevation data, extract the actual elevation profile
-            if has_elevation:
-                # Extract actual elevation profile for this lap
-                actual_elevation = lap_data["altitude"].values
-
-                # Store the actual elevation profile with its distances
-                self.lap_actual_elevation.append((distances, actual_elevation))
-
-        # Calculate mean actual elevation profile if we have elevation data
-        if has_elevation and self.lap_actual_elevation:
-            # Initialize array to accumulate elevation values
-            elevation_sum = np.zeros_like(reference_distance)
-            elevation_count = np.zeros_like(reference_distance)
-
-            # For each lap's actual elevation profile
-            for distances, elevations in self.lap_actual_elevation:
-                # Interpolate this lap's elevation onto the reference distance array
-                interpolated_elevation = np.interp(
-                    reference_distance,
-                    distances * 1000,  # Convert km to m
-                    elevations,
-                    left=np.nan,
-                    right=np.nan,
-                )
-
-                # Add to the sum and count non-NaN values
-                valid_mask = ~np.isnan(interpolated_elevation)
-                elevation_sum[valid_mask] += interpolated_elevation[valid_mask]
-                elevation_count[valid_mask] += 1
-
-            # Calculate mean, avoiding division by zero
-            mean_elevation = np.zeros_like(reference_distance)
-            valid_points = elevation_count > 0
-            mean_elevation[valid_points] = (
-                elevation_sum[valid_points] / elevation_count[valid_points]
-            )
-
-            # Store the mean actual elevation profile
-            self.mean_actual_elevation = mean_elevation
-            self.mean_actual_distance_km = reference_distance_km
 
     def update_plots(self):
         """Update the virtual elevation plots"""
@@ -987,7 +1021,7 @@ class GPSLapResult(QMainWindow):
             )
 
         self.fig_canvas.fig.tight_layout()
-        self.fig_canvas.draw()
+        self.fig_canvas.draw_idle()
 
     def on_trim_start_changed(self, value):
         """Handle trim start slider value change"""
@@ -1009,12 +1043,7 @@ class GPSLapResult(QMainWindow):
             self.gps_marker_label.setText(f"{value} s")
             self.map_widget.set_marker_pos(value)
 
-        # Detect laps based on new trim values
-        self.detect_laps()
-
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map to show trim points
         self.map_widget.set_trim_start(self.trim_start)
@@ -1040,12 +1069,7 @@ class GPSLapResult(QMainWindow):
             self.gps_marker_label.setText(f"{value} s")
             self.map_widget.set_marker_pos(value)
 
-        # Detect laps based on new trim values
-        self.detect_laps()
-
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         self.map_widget.set_trim_end(self.trim_end)
         self.map_widget.update()
@@ -1055,12 +1079,7 @@ class GPSLapResult(QMainWindow):
         self.gps_marker_pos = value
         self.gps_marker_label.setText(f"{value} s")
 
-        # Detect laps based on new GPS marker position
-        self.detect_laps()
-
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(True)
 
         # Update map to show GPS marker
         self.map_widget.set_marker_pos(value)
@@ -1071,9 +1090,8 @@ class GPSLapResult(QMainWindow):
         self.current_cda = value / 1000.0
         self.cda_label.setText(f"{self.current_cda:.3f}")
 
-        # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(False)
+
         self.update_config_text()
 
     def on_crr_changed(self, value):
@@ -1081,9 +1099,8 @@ class GPSLapResult(QMainWindow):
         self.current_crr = value / 10000.0
         self.crr_label.setText(f"{self.current_crr:.4f}")
 
-        # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update(False)
+
         self.update_config_text()
 
     def save_results(self):
@@ -1212,6 +1229,28 @@ class GPSLapResult(QMainWindow):
         self.parent.show()
         self.close()
 
+    def async_update(self, new_laps):
+        values = {}
+        for key in VEWorker.INPUT_KEYS:
+            values[key] = getattr(self, key)
+        values["detect_laps"] = new_laps and self.has_gps
+
+        self.ve_worker.set_values(values)
+
+    def on_ve_result_ready(self, res):
+        for key in VEWorker.RESULT_KEYS:
+            if key in res:
+                setattr(self, key, res[key])
+
+        # Update the lap table
+        if res["detect_laps"]:
+            self.update_lap_table()
+
+        self.update_plots()
+
     def closeEvent(self, event):
         self.map_widget.close()
+        self.ve_thread.quit()
+        self.ve_thread.wait()
+
         event.accept()
