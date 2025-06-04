@@ -10,7 +10,10 @@ import folium
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+)
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -30,7 +33,135 @@ from PySide6.QtWidgets import (
 
 from models.virtual_elevation import VirtualElevation
 from ui.map_widget import (MapWidget, MapMode)
+from ui.async_worker import AsyncWorker
 
+class VEWorker(AsyncWorker):
+    INPUT_KEYS = [
+        "trim_start",
+        "trim_end",
+        "current_cda",
+        "current_crr"
+    ]
+
+    RESULT_KEYS = [
+        "actual_elevation",
+        "actual_elevation_diff",
+        "distance",
+        "r2",
+        "rmse",
+        "virtual_elevation_calibrated",
+    ]
+
+    def __init__(self, merged_data, params):
+        super(VEWorker, self).__init__()
+        self.merged_data = merged_data
+        # Create VE calculator
+        self.ve_calculator = VirtualElevation(self.merged_data, params)
+
+    def _process_value(self, values: dict):
+        for key in VEWorker.INPUT_KEYS:
+            setattr(self, key, values[key])
+
+        self.calculate_ve()
+        self.prepare_plots()
+
+        out_values = {}
+        for key in VEWorker.RESULT_KEYS:
+            out_values[key] = getattr(self, key)
+
+        return out_values
+
+    def calculate_ve(self):
+        """Calculate virtual elevation with current parameters"""
+        # Extract actual elevation if available
+        self.actual_elevation = None
+        if (
+            "altitude" in self.merged_data.columns
+            and not self.merged_data["altitude"].isna().all()
+        ):
+            self.actual_elevation = self.merged_data["altitude"].values
+
+        # Calculate virtual elevation
+        self.virtual_elevation = self.ve_calculator.calculate_ve(
+            self.current_cda, self.current_crr
+        )
+
+        # Calculate metrics
+        if self.actual_elevation is not None:
+            # Ensure same length
+            min_len = min(len(self.virtual_elevation), len(self.actual_elevation))
+            ve_trim = self.virtual_elevation[:min_len]
+            elev_trim = self.actual_elevation[:min_len]
+
+            # Calibrate to match at trim start
+            trim_start_idx = self.trim_start
+            if trim_start_idx < min_len:
+                # Calculate offset to make virtual elevation match actual at trim start
+                offset = elev_trim[trim_start_idx] - ve_trim[trim_start_idx]
+                ve_calibrated = ve_trim + offset
+                self.virtual_elevation_calibrated = ve_calibrated
+            else:
+                self.virtual_elevation_calibrated = ve_trim
+
+            # Calculate metrics in trimmed region
+            trim_indices = np.where(
+                (np.arange(len(ve_trim)) >= self.trim_start)
+                & (np.arange(len(ve_trim)) <= self.trim_end)
+            )[0]
+
+            if len(trim_indices) > 2:  # Need at least 3 points for correlation
+                ve_trim_region = self.virtual_elevation_calibrated[trim_indices]
+                elev_trim_region = elev_trim[trim_indices]
+
+                # R² calculation
+                corr = np.corrcoef(ve_trim_region, elev_trim_region)[0, 1]
+                self.r2 = corr**2
+
+                # RMSE calculation
+                self.rmse = np.sqrt(np.mean((ve_trim_region - elev_trim_region) ** 2))
+
+                # Calculate elevation gain (difference between end and start)
+                # Make sure we don't exceed array bounds
+                safe_trim_end = min(self.trim_end, len(ve_trim) - 1)
+                safe_trim_start = min(self.trim_start, safe_trim_end)
+
+                # Elevation differences
+                self.ve_elevation_diff = (
+                    ve_calibrated[safe_trim_end] - ve_calibrated[safe_trim_start]
+                )
+                self.actual_elevation_diff = (
+                    elev_trim[safe_trim_end] - elev_trim[safe_trim_start]
+                )
+            else:
+                self.r2 = 0
+                self.rmse = 0
+                self.ve_elevation_diff = 0
+                self.actual_elevation_diff = 0
+        else:
+            # If no actual elevation data, still create a calibrated version
+            self.virtual_elevation_calibrated = self.virtual_elevation.copy()
+            self.ve_elevation_diff = (
+                self.virtual_elevation_calibrated[
+                    min(self.trim_end, len(self.virtual_elevation_calibrated) - 1)
+                ]
+                - self.virtual_elevation_calibrated[
+                    min(self.trim_start, len(self.virtual_elevation_calibrated) - 1)
+                ]
+            )
+
+    def prepare_plots(self):
+        # Use recorded distance from FIT file (convert to km) and reset to start from 0
+        if 'distance' in self.merged_data.columns and not self.merged_data['distance'].isna().all():
+            # Use recorded distance from FIT file (in meters), reset to start from 0, convert to km
+            distance_raw = self.merged_data['distance'].values
+            self.distance = (distance_raw - distance_raw[0]) / 1000  # Reset to 0 and convert to km
+        elif hasattr(self.ve_calculator, 'df') and 'v' in self.ve_calculator.df.columns:
+            # Fallback: calculate cumulative distance from speed (v is in m/s, dt=1s)
+            distance_m = np.cumsum(self.ve_calculator.df['v'].values * self.ve_calculator.dt)
+            self.distance = distance_m / 1000  # Convert to km
+        else:
+            # Final fallback to time-based if no distance or speed data
+            self.distance = np.arange(len(self.virtual_elevation)) / 1000
 
 class MplCanvas(FigureCanvas):
     """Matplotlib canvas for embedding in Qt"""
@@ -59,8 +190,11 @@ class AnalysisResult(QMainWindow):
         # Prepare merged lap data
         self.prepare_merged_data()
 
-        # Create VE calculator
-        self.ve_calculator = VirtualElevation(self.merged_data, self.params)
+        self.ve_worker = VEWorker(self.merged_data, self.params)
+        self.ve_thread = QThread()
+        self.ve_worker.moveToThread(self.ve_thread)
+        self.ve_worker.resultReady.connect(self.on_ve_result_ready)
+        self.ve_thread.start()
 
         # Get lap combination ID for settings
         self.lap_combo_id = "_".join(map(str, sorted(self.selected_laps)))
@@ -103,9 +237,7 @@ class AnalysisResult(QMainWindow):
         # Setup UI
         self.initUI()
 
-        # Calculate and plot initial VE
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update()
 
     def prepare_merged_data(self):
         """Extract and merge data for selected laps"""
@@ -314,84 +446,6 @@ class AnalysisResult(QMainWindow):
 
         self.config_text.setText(config_text)
 
-    def calculate_ve(self):
-        """Calculate virtual elevation with current parameters"""
-        # Extract actual elevation if available
-        self.actual_elevation = None
-        if (
-            "altitude" in self.merged_data.columns
-            and not self.merged_data["altitude"].isna().all()
-        ):
-            self.actual_elevation = self.merged_data["altitude"].values
-
-        # Calculate virtual elevation
-        self.virtual_elevation = self.ve_calculator.calculate_ve(
-            self.current_cda, self.current_crr
-        )
-
-        # Calculate metrics
-        if self.actual_elevation is not None:
-            # Ensure same length
-            min_len = min(len(self.virtual_elevation), len(self.actual_elevation))
-            ve_trim = self.virtual_elevation[:min_len]
-            elev_trim = self.actual_elevation[:min_len]
-
-            # Calibrate to match at trim start
-            trim_start_idx = self.trim_start
-            if trim_start_idx < min_len:
-                # Calculate offset to make virtual elevation match actual at trim start
-                offset = elev_trim[trim_start_idx] - ve_trim[trim_start_idx]
-                ve_calibrated = ve_trim + offset
-                self.virtual_elevation_calibrated = ve_calibrated
-            else:
-                self.virtual_elevation_calibrated = ve_trim
-
-            # Calculate metrics in trimmed region
-            trim_indices = np.where(
-                (np.arange(len(ve_trim)) >= self.trim_start)
-                & (np.arange(len(ve_trim)) <= self.trim_end)
-            )[0]
-
-            if len(trim_indices) > 2:  # Need at least 3 points for correlation
-                ve_trim_region = self.virtual_elevation_calibrated[trim_indices]
-                elev_trim_region = elev_trim[trim_indices]
-
-                # R² calculation
-                corr = np.corrcoef(ve_trim_region, elev_trim_region)[0, 1]
-                self.r2 = corr**2
-
-                # RMSE calculation
-                self.rmse = np.sqrt(np.mean((ve_trim_region - elev_trim_region) ** 2))
-
-                # Calculate elevation gain (difference between end and start)
-                # Make sure we don't exceed array bounds
-                safe_trim_end = min(self.trim_end, len(ve_trim) - 1)
-                safe_trim_start = min(self.trim_start, safe_trim_end)
-
-                # Elevation differences
-                self.ve_elevation_diff = (
-                    ve_calibrated[safe_trim_end] - ve_calibrated[safe_trim_start]
-                )
-                self.actual_elevation_diff = (
-                    elev_trim[safe_trim_end] - elev_trim[safe_trim_start]
-                )
-            else:
-                self.r2 = 0
-                self.rmse = 0
-                self.ve_elevation_diff = 0
-                self.actual_elevation_diff = 0
-        else:
-            # If no actual elevation data, still create a calibrated version
-            self.virtual_elevation_calibrated = self.virtual_elevation.copy()
-            self.ve_elevation_diff = (
-                self.virtual_elevation_calibrated[
-                    min(self.trim_end, len(self.virtual_elevation_calibrated) - 1)
-                ]
-                - self.virtual_elevation_calibrated[
-                    min(self.trim_start, len(self.virtual_elevation_calibrated) - 1)
-                ]
-            )
-
     def update_plots(self):
         """Update the virtual elevation plots"""
         # Clear previous plots
@@ -399,22 +453,12 @@ class AnalysisResult(QMainWindow):
 
         # Create figure with two subplots
         self.fig_canvas.fig.clear()
+
         gs = self.fig_canvas.fig.add_gridspec(2, 1, height_ratios=[3, 1])
         ax1 = self.fig_canvas.fig.add_subplot(gs[0])
         ax2 = self.fig_canvas.fig.add_subplot(gs[1])
 
-        # Use recorded distance from FIT file (convert to km) and reset to start from 0
-        if 'distance' in self.merged_data.columns and not self.merged_data['distance'].isna().all():
-            # Use recorded distance from FIT file (in meters), reset to start from 0, convert to km
-            distance_raw = self.merged_data['distance'].values
-            distance = (distance_raw - distance_raw[0]) / 1000  # Reset to 0 and convert to km
-        elif hasattr(self.ve_calculator, 'df') and 'v' in self.ve_calculator.df.columns:
-            # Fallback: calculate cumulative distance from speed (v is in m/s, dt=1s)
-            distance_m = np.cumsum(self.ve_calculator.df['v'].values * self.ve_calculator.dt)
-            distance = distance_m / 1000  # Convert to km
-        else:
-            # Final fallback to time-based if no distance or speed data
-            distance = np.arange(len(self.virtual_elevation)) / 1000
+        distance = self.distance
 
         # Plot virtual elevation with FULL OPACITY in trimmed region, REDUCED OPACITY elsewhere
         # First plot full curve with reduced opacity
@@ -579,7 +623,7 @@ class AnalysisResult(QMainWindow):
             )
 
         self.fig_canvas.fig.tight_layout()
-        self.fig_canvas.draw()
+        self.fig_canvas.draw_idle()
 
     def on_trim_start_changed(self, value):
         """Handle trim start slider value change"""
@@ -591,9 +635,7 @@ class AnalysisResult(QMainWindow):
         self.trim_start = value
         self.trim_start_label.setText(f"{value} s")
 
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update()
 
         # Update map to show trim points
         self.map_widget.set_trim_start(self.trim_start)
@@ -609,9 +651,7 @@ class AnalysisResult(QMainWindow):
         self.trim_end = value
         self.trim_end_label.setText(f"{value} s")
 
-        # Recalculate VE metrics and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update()
 
         self.map_widget.set_trim_end(self.trim_end)
         self.map_widget.update()
@@ -621,9 +661,8 @@ class AnalysisResult(QMainWindow):
         self.current_cda = value / 1000.0
         self.cda_label.setText(f"{self.current_cda:.3f}")
 
-        # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update()
+
         self.update_config_text()
 
     def on_crr_changed(self, value):
@@ -631,9 +670,8 @@ class AnalysisResult(QMainWindow):
         self.current_crr = value / 10000.0
         self.crr_label.setText(f"{self.current_crr:.4f}")
 
-        # Recalculate VE and update plots
-        self.calculate_ve()
-        self.update_plots()
+        self.async_update()
+
         self.update_config_text()
 
     def _fit_map_to_full_route(self, m):
@@ -776,7 +814,21 @@ class AnalysisResult(QMainWindow):
         self.parent.show()
         self.close()
 
+    def async_update(self):
+        values = {}
+        for key in VEWorker.INPUT_KEYS:
+            values[key] = getattr(self, key)
+        self.ve_worker.set_values(values)
+
+    def on_ve_result_ready(self, res):
+        for key in VEWorker.RESULT_KEYS:
+            if key in res:
+                setattr(self, key, res[key])
+        self.update_plots()
+
     def closeEvent(self, event):
         self.map_widget.close()
+        self.ve_thread.quit()
+        self.ve_thread.wait()
 
         event.accept()
