@@ -47,8 +47,9 @@ class MplCanvas(FigureCanvas):
 class AnalysisResult(QMainWindow):
     """Window for displaying virtual elevation analysis results"""
 
-    def __init__(self, fit_file, settings, selected_laps, params):
+    def __init__(self, parent, fit_file, settings, selected_laps, params):
         super().__init__()
+        self.parent = parent
         self.fit_file = fit_file
         self.settings = settings
         self.selected_laps = selected_laps
@@ -772,10 +773,7 @@ class AnalysisResult(QMainWindow):
 
     def back_to_selection(self):
         """Return to lap selection window"""
-        from ui.analysis_window import AnalysisWindow
-
-        self.analysis_window = AnalysisWindow(self.fit_file, self.settings)
-        self.analysis_window.show()
+        self.parent.show()
         self.close()
 
     def closeEvent(self, event):
