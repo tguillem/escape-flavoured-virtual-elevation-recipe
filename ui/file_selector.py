@@ -92,7 +92,7 @@ class FileSelector(QMainWindow):
         self.dem_file_label = QLabel("Correct Elevation:")
         self.dem_file_path = QLineEdit()
         self.dem_file_path.setPlaceholderText("OPTIONAL: Select DEM file to correct GPS elevation data...")
-        if self.settings.last_dem_file and os.path.exists(self.settings.last_dem_file):
+        if self.settings.last_dem_file:
             self.dem_file_path.setText(self.settings.last_dem_file)
         self.dem_file_button = QPushButton("Browse")
         self.dem_file_button.clicked.connect(self.select_dem_file)
@@ -158,10 +158,6 @@ class FileSelector(QMainWindow):
         if not file_path or not os.path.exists(file_path):
             QMessageBox.warning(self, "Invalid File", "Please select a valid FIT file.")
             return
-
-        if dem_file_path and not os.path.exists(dem_file_path):
-            QMessageBox.warning(self, "Invalid DEM File", "Not correcting elevation")
-            dem_file_path = None
 
         # Create results directory if it doesn't exist
         result_dir = self.dir_path.text()
