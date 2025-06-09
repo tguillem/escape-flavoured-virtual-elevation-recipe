@@ -91,9 +91,7 @@ class FileSelector(QMainWindow):
         dem_file_layout = QHBoxLayout()
         self.dem_file_label = QLabel("Correct Elevation:")
         self.dem_file_path = QLineEdit()
-        self.dem_file_path.setPlaceholderText("OPTIONAL: Select DEM file to correct GPS elevation data...")
-        if self.settings.last_dem_file:
-            self.dem_file_path.setText(self.settings.last_dem_file)
+        self.update_dem_file_path_widget(self.settings.last_dem_file)
         self.dem_file_button = QPushButton("Browse")
         self.dem_file_button.clicked.connect(self.select_dem_file)
         self.dem_file_path.editingFinished.connect(self.dem_file_path_edited)
@@ -135,25 +133,44 @@ class FileSelector(QMainWindow):
             self.settings.last_file = file_path
             self.settings.save_settings()
 
+    def update_dem_file_path_widget(self, dem_files):
+        place_holder = "OPTIONAL: Select DEM file(s) to correct GPS elevation data..."
+        text = ""
+        if dem_files:
+            if isinstance(dem_files, list):
+                if len(dem_files) == 1:
+                    # Single file selected
+                    text = dem_files[0]
+                else:
+                    # Multiple files selected – show count and basename
+                    place_holder = f"{len(dem_files)} files selected (e.g. {os.path.basename(dem_files[0])})"
+            else:
+                # Already a single string
+                text = dem_files
+        self.dem_file_path.setText(text)
+        self.dem_file_path.setPlaceholderText(place_holder)
+
     def select_dem_file(self):
-        dem_file_path, _ = QFileDialog.getOpenFileName(
+        dem_file_path, _ = QFileDialog.getOpenFileNames(
             self, "Select DEM File (*.vrt *.tif *.asc)", "",
             "DEM Files (*.vrt *.tif *.tiff *asc);;VRT Files (*.vrt);;GeoTIFF Files (*.tif *.tiff);;Arc/Info Grid (*.asc)"
         )
 
         if dem_file_path:
-            self.dem_file_path.setText(dem_file_path)
+            self.update_dem_file_path_widget(dem_file_path)
             self.settings.last_dem_file = dem_file_path
             self.settings.save_settings()
 
     def dem_file_path_edited(self):
         dem_file_path = self.dem_file_path.text()
+        self.update_dem_file_path_widget(dem_file_path)
+
         self.settings.last_dem_file = dem_file_path
         self.settings.save_settings()
 
     def analyze_file(self):
         file_path = self.file_path.text()
-        dem_file_path = self.dem_file_path.text()
+        dem_file_path = self.settings.last_dem_file
 
         if not file_path or not os.path.exists(file_path):
             QMessageBox.warning(self, "Invalid File", "Please select a valid FIT file.")
