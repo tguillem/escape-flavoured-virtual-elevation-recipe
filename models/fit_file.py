@@ -4,6 +4,7 @@ import threading
 from fitparse import FitFile as FitParser
 import rasterio
 from rasterio.windows import Window
+import tempfile, os
 
 from pyproj import Transformer
 
@@ -15,6 +16,35 @@ class AltitudeLookup:
     TILE_SIZE = 512
 
     def __init__(self, dem_path):
+        self.vrt_path = None
+
+        # Handle case where dem_path contains mutliple files, build .vrt file if possible
+        if isinstance(dem_path, (list, tuple)) or ("*" in dem_path):
+            try:
+                from osgeo import gdal
+
+                # Expand glob if needed
+                if isinstance(dem_path, str):
+                    import glob
+                    dem_files = glob.glob(dem_path)
+                else:
+                    dem_files = dem_path
+
+                if len(dem_files) == 0:
+                    raise FileNotFoundError("No DEM files matched")
+
+                # Create temporary file
+                tmp = tempfile.NamedTemporaryFile(suffix=".vrt", delete=False)
+                self.vrt_path = tmp.name
+                tmp.close()
+
+                # Build temporary VRT file
+                vrt_opts = gdal.BuildVRTOptions(outputSRS="EPSG:2154")
+                gdal.BuildVRT(self.vrt_path, dem_files, options=vrt_opts)
+                dem_path = self.vrt_path
+            except ImportError:
+                raise ImportError("GDAL is required to mosaic multiple DEM files")
+
         self.dataset = rasterio.open(dem_path)
         self.transformer = Transformer.from_crs("EPSG:4326", self.dataset.crs, always_xy=True)
 
@@ -59,6 +89,8 @@ class AltitudeLookup:
 
     def close(self):
         self.dataset.close()
+        if self.vrt_path:
+            os.remove(self.vrt_path)
 
 class FitFile:
     def __init__(self, filename, dem_filename):
