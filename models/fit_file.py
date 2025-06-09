@@ -63,10 +63,10 @@ class AltitudeLookup:
 class FitFile:
     def __init__(self, filename, dem_filename):
         """Load and parse a FIT file"""
-        self.elevation = AltitudeLookup(dem_filename) if dem_filename else None
         self.elevation_error_rate = 0
 
         self.filename = filename
+        self.dem_filename = dem_filename
         self.fit_parser = FitParser(filename)
 
         # Extract data
@@ -78,8 +78,11 @@ class FitFile:
         self.cancel_event = threading.Event()
 
     def parse(self):
-        self.parse_data()
+        elevation = AltitudeLookup(self.dem_filename) if self.dem_filename else None
+        self.parse_data(elevation)
         self.resample_data()
+        if elevation:
+            elevation.close()
 
     def cancel(self):
         self.cancel_event.set()
@@ -88,7 +91,7 @@ class FitFile:
         if self.cancel_event.is_set():
             raise CancelledError("cancelled")
 
-    def parse_data(self):
+    def parse_data(self, elevation):
         """Parse data from FIT file"""
         # Temporary storage for records
         records = []
@@ -222,13 +225,13 @@ class FitFile:
                     180 / 2**31
                 )
 
-                if self.elevation:
+                if elevation:
                     lat_col = self.records_df["position_lat"].values
                     lon_col = self.records_df["position_long"].values
 
                     self.check_canceled()
 
-                    alts = self.elevation.batch_lookup(lat_col, lon_col)
+                    alts = elevation.batch_lookup(lat_col, lon_col)
 
                     # Fallback to original alt if DEM fails
                     alt_col = self.records_df["altitude"].values
