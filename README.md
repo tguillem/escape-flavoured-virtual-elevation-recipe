@@ -97,10 +97,14 @@ Power = Aero_drag + Rolling_resistance + Gravity + Acceleration
 For France:
  - Download 1m rgealti here: https://geoservices.ign.fr/rgealti#telechargement1m
  - Extract the 7zip
- - cd RGEALTI/1_DONNEES_LIVRAISON_2021-01-00157/RGEALTI_MNT_1M_ASC_LAMB93_IGN69_D075_20210118
- - gdalbuildvrt -a_srs EPSG:2154 -allow_projection_difference mosaic_l93.vrt *.asc
+ - In the VE application, select all .asc files from RGEALTI/1_DONNEES_LIVRAISON_2021-01-00157/RGEALTI_MNT_1M_ASC_LAMB93_IGN69_D075_20210118
 
-Use this mosaic_l93.vrt file from the "Correct Elevation" dialog.
+For USA:
+ - Go to https://apps.nationalmap.gov/downloader/
+ - Select "Elevation Products (3D Elevation Program Products and Services)"
+ - Search your area (Right corner)
+ - Download the tiff files that cover your area (prioritize 1 meter DEM)
+ - In the VE application, select one or all downloaded .tiff files
 
 ### Parameters
 - **CdA**: Coefficient of drag × frontal area (m²)
