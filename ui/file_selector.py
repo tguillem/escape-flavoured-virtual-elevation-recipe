@@ -87,6 +87,21 @@ class FileSelector(QMainWindow):
         dir_layout.addWidget(self.dir_path)
         dir_layout.addWidget(self.dir_button)
 
+        # rho File selection
+        rho_file_layout = QHBoxLayout()
+        self.rho_file_label = QLabel("Weather file:")
+        self.rho_file_path = QLineEdit()
+        self.rho_file_path.setPlaceholderText("OPTIONAL: Select weather csv file to estimate Rho...")
+        if self.settings.last_rho_file and os.path.exists(self.settings.last_rho_file):
+            self.rho_file_path.setText(self.settings.last_rho_file)
+        self.rho_file_button = QPushButton("Browse")
+        self.rho_file_button.clicked.connect(self.select_rho_file)
+        self.rho_file_path.editingFinished.connect(self.rho_file_path_edited)
+
+        rho_file_layout.addWidget(self.rho_file_label)
+        rho_file_layout.addWidget(self.rho_file_path)
+        rho_file_layout.addWidget(self.rho_file_button)
+
         # DEM File selection
         dem_file_layout = QHBoxLayout()
         self.dem_file_label = QLabel("Correct Elevation:")
@@ -118,6 +133,7 @@ class FileSelector(QMainWindow):
         # Add layouts to main layout
         main_layout.addLayout(file_layout)
         main_layout.addLayout(dir_layout)
+        main_layout.addLayout(rho_file_layout)
         main_layout.addLayout(dem_file_layout)
         main_layout.addStretch()
         main_layout.addLayout(button_layout)
@@ -141,6 +157,23 @@ class FileSelector(QMainWindow):
             self.settings.last_file = file_path
             self.settings.save_settings()
 
+    def select_rho_file(self):
+        rho_file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Weather File (*.csv)",
+            self._get_start_dir(self.settings.last_rho_file),
+            "Weather Files (*.csv)"
+        )
+
+        if rho_file_path:
+            self.rho_file_path.setText(rho_file_path)
+            self.settings.last_rho_file = rho_file_path
+            self.settings.save_settings()
+
+    def rho_file_path_edited(self):
+        rho_file_path = self.rho_file_path.text()
+        self.settings.last_rho_file = rho_file_path
+        self.settings.save_settings()
+
     def select_dem_file(self):
         dem_file_path, _ = QFileDialog.getOpenFileName(
             self, "Select DEM File (*.vrt *.tif *.asc)",
@@ -160,11 +193,16 @@ class FileSelector(QMainWindow):
 
     def analyze_file(self):
         file_path = self.file_path.text()
+        rho_file_path = self.rho_file_path.text()
         dem_file_path = self.dem_file_path.text()
 
         if not file_path or not os.path.exists(file_path):
             QMessageBox.warning(self, "Invalid File", "Please select a valid FIT file.")
             return
+
+        if rho_file_path and not os.path.exists(rho_file_path):
+            QMessageBox.warning(self, "Invalid Weather File", "Not parsing Rho")
+            rho_file_path = None
 
         if dem_file_path and not os.path.exists(dem_file_path):
             QMessageBox.warning(self, "Invalid DEM File", "Not correcting elevation")
@@ -178,7 +216,7 @@ class FileSelector(QMainWindow):
             self.settings.save_settings()
 
         self.thread = QThread()
-        fit_file = FitFile(file_path, dem_file_path)
+        fit_file = FitFile(file_path, rho_file_path, dem_file_path)
         self.worker = FitFileWorker(fit_file)
         self.worker.moveToThread(self.thread)
 

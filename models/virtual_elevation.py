@@ -113,6 +113,7 @@ class VirtualElevation:
         w = self.df["watts"].values * self.eta
         vg = self.df["v"].values
         acc = self.df["a"].values
+        rho = self.df["rho_smooth"].values if "rho_smooth" in self.df else None
 
         # Calculate effective wind based on direction
         if self.wind_speed != 0 and self.wind_direction is not None:
@@ -134,11 +135,12 @@ class VirtualElevation:
             valid_w = w[valid_idx]
             valid_acc = acc[valid_idx]
             valid_va = va[valid_idx]
+            valid_rho = rho[valid_idx] if rho is not None else self.rho
 
             # Virtual slope calculation
             valid_slope = (
                 (valid_w / (valid_vg * self.kg * 9.807))
-                - (cda * self.rho * valid_va**2 / (2 * self.kg * 9.807))
+                - (cda * valid_rho * valid_va**2 / (2 * self.kg * 9.807))
                 - crr
                 - valid_acc / 9.807
             )

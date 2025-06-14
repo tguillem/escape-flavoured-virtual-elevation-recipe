@@ -4,6 +4,7 @@ import threading
 from fitparse import FitFile as FitParser
 import rasterio
 from rasterio.windows import Window
+from models.rho_lookup import RhoLookup
 
 from pyproj import Transformer
 
@@ -63,11 +64,12 @@ class AltitudeLookup:
         self.dataset.close()
 
 class FitFile:
-    def __init__(self, filename, dem_filename):
+    def __init__(self, filename, rho_filename, dem_filename):
         """Load and parse a FIT file"""
         self.elevation_error_rate = 0
 
         self.filename = filename
+        self.rho_filename = rho_filename
         self.dem_filename = dem_filename
         self.fit_parser = FitParser(filename)
 
@@ -80,9 +82,10 @@ class FitFile:
         self.cancel_event = threading.Event()
 
     def parse(self):
+        rho_df = RhoLookup(self.rho_filename).get_df() if self.rho_filename else None
         elevation = AltitudeLookup(self.dem_filename) if self.dem_filename else None
         self.parse_data(elevation)
-        self.resample_data()
+        self.resample_data(rho_df)
         if elevation:
             elevation.close()
 
@@ -245,7 +248,7 @@ class FitFile:
 
         self.check_canceled()
 
-    def resample_data(self):
+    def resample_data(self, rho_df):
         """Resample data to 1s intervals"""
         if "timestamp" not in self.records_df.columns:
             raise ValueError("No timestamp data found in FIT file")
@@ -258,6 +261,59 @@ class FitFile:
 
         # Reset index to have timestamp as a column
         self.resampled_df.reset_index(inplace=True)
+
+        # Merge rho data if provided
+        if rho_df is not None:
+            timezone_offset = self._get_timezone_offset()
+            print(f"timezone_offset: {timezone_offset}")
+            rho_df["timestamp"] -= pd.Timedelta(hours=timezone_offset)
+            self.resampled_df = pd.merge_asof(
+                self.resampled_df, rho_df,
+                on="timestamp",
+                direction="nearest",
+                tolerance=pd.Timedelta(seconds=1),
+            )
+
+
+    def _get_timezone_offset(self):
+        """Get timezone offset in hours from GPS coordinates"""
+        try:
+            # Get first GPS coordinates from the data
+            if 'position_lat' not in self.records_df.columns or 'position_long' not in self.records_df.columns:
+                raise ValueError("No GPS data")
+
+            # Find first valid GPS coordinates
+            valid_coords = self.records_df[
+                (self.records_df['position_lat'].notna()) & 
+                (self.records_df['position_long'].notna())
+            ]
+
+            if valid_coords.empty:
+                raise ValueError("No valid GPS data")
+
+            from timezonefinder import TimezoneFinder
+            import pytz
+            from datetime import datetime
+            lat = valid_coords['position_lat'].iloc[0]
+            lon = valid_coords['position_long'].iloc[0]
+
+            # Get timezone
+            tf = TimezoneFinder()
+            timezone_str = tf.timezone_at(lat=lat, lng=lon)
+
+            if timezone_str:
+                tz = pytz.timezone(timezone_str)
+                # Get current offset (accounting for DST)
+                now = datetime.now(tz)
+                offset_seconds = now.utcoffset().total_seconds()
+                offset_hours = offset_seconds / 3600
+
+                print(f"Detected timezone: {timezone_str} (UTC{offset_hours:+.1f})")
+                return offset_hours
+
+        except Exception as e:
+            print(f"Error detecting timezone: {e}, using UTC")
+            return 0
 
     def get_lap_data(self):
         """Return processed lap data with calculated fields"""

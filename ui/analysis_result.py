@@ -297,6 +297,14 @@ class VEWorker(AsyncWorker):
             ax2.set_ylabel("Residuals (m)")
             ax2.set_title("Residuals (Virtual - Actual)")
 
+        if "rho_smooth" in self.merged_data.columns:
+            rho_values = self.merged_data["rho_smooth"].values[:len(distance)]
+            ax1_rho = ax1.twinx()  # Create secondary y-axis sharing the same x-axis
+            ax1_rho.plot(distance, rho_values, color="purple", linestyle="--", linewidth=2, label="Air Density (Rho)")
+            ax1_rho.set_ylabel("Air Density (kg/m³)", color="purple")
+            ax1_rho.tick_params(axis="y", labelcolor="purple")
+            ax1_rho.grid(False)  # Avoid double grid clutter
+
         # Set titles and labels for the main plot
         ax1.set_ylabel("Elevation (m)")
         ax1.set_title("Virtual Elevation Profile")
