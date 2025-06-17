@@ -125,9 +125,15 @@ class FileSelector(QMainWindow):
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
+    @staticmethod
+    def _get_start_dir(file):
+        return os.path.dirname(file) if file and os.path.exists(os.path.dirname(file)) else ""
+
     def select_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select FIT File", "", "FIT Files (*.fit)"
+            self, "Select FIT File",
+            self._get_start_dir(self.settings.last_file),
+            "FIT Files (*.fit)"
         )
 
         if file_path:
@@ -137,7 +143,8 @@ class FileSelector(QMainWindow):
 
     def select_dem_file(self):
         dem_file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select DEM File (*.vrt *.tif *.asc)", "",
+            self, "Select DEM File (*.vrt *.tif *.asc)",
+            self._get_start_dir(self.settings.last_dem_file),
             "DEM Files (*.vrt *.tif *.tiff *asc);;VRT Files (*.vrt);;GeoTIFF Files (*.tif *.tiff);;Arc/Info Grid (*.asc)"
         )
 
